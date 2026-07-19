@@ -106,13 +106,17 @@ def build_messages(user_message: str, history: list = None) -> list:
 
 async def call_ai(user_message: str, conversation_history: list = None) -> str:
     """调用 DeepSeek API"""
+    api_key = DEEPSEEK_API_KEY.strip()
+    if not api_key or not api_key.startswith("sk-"):
+        return "❌ DeepSeek API Key 未配置或格式错误。请在 Railway Variables 中设置 DEEPSEEK_API_KEY。"
+
     messages = build_messages(user_message, conversation_history)
 
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(
             DEEPSEEK_URL,
             headers={
-                "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
             },
             json={
@@ -294,6 +298,18 @@ async def test_feishu():
             results["bot_info"] = f"ERROR: {bot_data}"
 
     return results
+
+
+@app.get("/test-ds")
+async def test_deepseek():
+    """诊断 DeepSeek API Key"""
+    api_key = DEEPSEEK_API_KEY.strip()
+    return {
+        "key_length": len(api_key),
+        "starts_with_sk": api_key.startswith("sk-"),
+        "first_8_chars": api_key[:8] if len(api_key) >= 8 else api_key,
+        "last_4_chars": api_key[-4:] if len(api_key) >= 4 else "N/A",
+    }
 
 
 # ── 健康检查 ─────────────────────────────────────
