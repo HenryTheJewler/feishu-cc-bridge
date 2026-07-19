@@ -28,6 +28,11 @@ DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
 # ── 运行时配置（/setup 注入或环境变量）─────────────
 _runtime: dict = {}
 
+FEISHU_WEBHOOK = os.environ.get(
+    "FEISHU_WEBHOOK",
+    "https://open.feishu.cn/open-apis/bot/v2/hook/786188af-8586-4ebb-9417-f8ad89943a9a",
+)
+
 for _key in ["FEISHU_APP_ID", "FEISHU_APP_SECRET", "DEEPSEEK_API_KEY"]:
     _val = os.environ.get(_key, "")
     if _val:
@@ -284,6 +289,18 @@ async def setup(request: Request):
         "ds_key_len": len(_env("DEEPSEEK_API_KEY").strip()),
         "app_id_set": bool(_env("FEISHU_APP_ID")),
     }
+
+
+# ── 提醒推送 ────────────────────────────────────
+@app.get("/remind")
+async def remind(msg: str = "中午了，来找Claude。今天把周计划排了。"):
+    """通过 webhook 发送飞书提醒"""
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            FEISHU_WEBHOOK,
+            json={"msg_type": "text", "content": {"text": msg}},
+        )
+        return {"ok": resp.json().get("code") == 0}
 
 
 # ── 启动 ──────────────────────────────────────────
