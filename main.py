@@ -19,9 +19,15 @@ logger = logging.getLogger("feishu-ai-bridge")
 app = FastAPI(title="Feishu-AI-Bridge")
 
 # ── 配置 ──────────────────────────────────────────
-FEISHU_APP_ID = os.environ["FEISHU_APP_ID"]
-FEISHU_APP_SECRET = os.environ["FEISHU_APP_SECRET"]
-DEEPSEEK_API_KEY = os.environ["DEEPSEEK_API_KEY"]
+def _require(key: str) -> str:
+    val = os.environ.get(key, "")
+    if not val:
+        logger.warning(f"环境变量 {key} 未设置")
+    return val
+
+FEISHU_APP_ID = _require("FEISHU_APP_ID")
+FEISHU_APP_SECRET = _require("FEISHU_APP_SECRET")
+DEEPSEEK_API_KEY = _require("DEEPSEEK_API_KEY")
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
 
 # 飞书 API
