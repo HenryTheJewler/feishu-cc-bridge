@@ -18,25 +18,26 @@ logger = logging.getLogger("feishu-ai-bridge")
 
 app = FastAPI(title="Feishu-AI-Bridge")
 
-# ── 配置 ──────────────────────────────────────────
-def _require(key: str) -> str:
-    val = os.environ.get(key, "")
-    if not val:
-        logger.warning(f"环境变量 {key} 未设置")
-    return val
-
-FEISHU_APP_ID = _require("FEISHU_APP_ID")
-FEISHU_APP_SECRET = _require("FEISHU_APP_SECRET")
-DEEPSEEK_API_KEY = _require("DEEPSEEK_API_KEY")
-DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
-
-# 飞书 API
+# ── 飞书 API 常量 ────────────────────────────────
 FEISHU_BASE = "https://open.feishu.cn/open-apis"
 TENANT_TOKEN_URL = f"{FEISHU_BASE}/auth/v3/tenant_access_token/internal"
 SEND_MSG_URL = f"{FEISHU_BASE}/im/v1/messages"
-
-# DeepSeek API (OpenAI 兼容)
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
+DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+
+# ── 运行时配置（/setup 注入或环境变量）─────────────
+_runtime: dict = {}
+
+for _key in ["FEISHU_APP_ID", "FEISHU_APP_SECRET", "DEEPSEEK_API_KEY"]:
+    _val = os.environ.get(_key, "")
+    if _val:
+        _runtime[_key] = _val
+
+
+def _env(key: str) -> str:
+    """优先读运行时配置，其次读环境变量"""
+    return _runtime.get(key) or os.environ.get(key, "")
+
 
 # ── 令牌缓存 ──────────────────────────────────────
 _token_cache: dict = {"token": None, "expires_at": 0}
@@ -48,10 +49,15 @@ async def get_tenant_token() -> str:
     if _token_cache["token"] and now < _token_cache["expires_at"] - 300:
         return _token_cache["token"]
 
+    app_id = _env("FEISHU_APP_ID")
+    app_secret = _env("FEISHU_APP_SECRET")
+    if not app_id or not app_secret:
+        raise RuntimeError("飞书 App ID/Secret 未配置，请调用 /setup")
+
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             TENANT_TOKEN_URL,
-            json={"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET},
+            json={"app_id": app_id, "app_secret": app_secret},
         )
         data = resp.json()
         if data.get("code") != 0:
@@ -96,7 +102,6 @@ SYSTEM_PROMPT = """你是「旺德兰 Wonderland」品牌主理人的 AI 助手�
 
 
 def build_messages(user_message: str, history: list = None) -> list:
-    """构建 OpenAI 格式消息列表"""
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     if history:
         messages.extend(history)
@@ -105,13 +110,11 @@ def build_messages(user_message: str, history: list = None) -> list:
 
 
 async def call_ai(user_message: str, conversation_history: list = None) -> str:
-    """调用 DeepSeek API"""
-    api_key = DEEPSEEK_API_KEY.strip()
+    api_key = _env("DEEPSEEK_API_KEY").strip()
     if not api_key or not api_key.startswith("sk-"):
-        return "❌ DeepSeek API Key 未配置或格式错误。请在 Railway Variables 中设置 DEEPSEEK_API_KEY。"
+        return "❌ DeepSeek API Key 未配置。请在飞书开发者后台调用 /setup 接口配置。"
 
     messages = build_messages(user_message, conversation_history)
-
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(
             DEEPSEEK_URL,
@@ -135,10 +138,8 @@ async def call_ai(user_message: str, conversation_history: list = None) -> str:
 
 
 async def send_feishu_message(open_id: str, text: str) -> None:
-    """通过飞书机器人回复消息"""
     token = await get_tenant_token()
     content = json.dumps({"text": text})
-
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             SEND_MSG_URL,
@@ -158,40 +159,38 @@ async def send_feishu_message(open_id: str, text: str) -> None:
             logger.error(f"发送消息失败: {data}")
 
 
-# ── 会话存储（内存，简易版）───────────────────────
-conversations: dict = defaultdict(list)  # open_id → [{role, content}]
-MAX_HISTORY = 10  # 保留最近 10 轮对话
-recent_logs: list = []  # 最近 20 条事件日志
+# ── 会话存储 ──────────────────────────────────────
+conversations: dict = defaultdict(list)
+MAX_HISTORY = 10
+recent_logs: list = []
 
 
 # ── 飞书事件回调 ─────────────────────────────────
 @app.post("/feishu/event")
 async def feishu_event(request: Request):
-    """接收飞书事件推送"""
     try:
         body = await request.json()
     except Exception:
         return JSONResponse({"code": 0})
 
-    # 记录所有事件
     header = body.get("header", {})
     event_type = (
-        body.get("type", "") or
-        header.get("event_type", "") or
-        body.get("event", {}).get("type", "")
+        body.get("type", "")
+        or header.get("event_type", "")
+        or body.get("event", {}).get("type", "")
     )
     log_entry = {"time": time.time(), "event_type": event_type or "unknown"}
     logger.info(f"收到事件 [{event_type}]: {json.dumps(body, ensure_ascii=False)[:300]}")
 
-    # URL 验证（v1 格式 & v2 格式都支持）
+    # URL 验证
     challenge = body.get("challenge", "")
     if challenge or event_type == "url_verification":
-        log_entry["msg"] = f"url_verification: {challenge}"
+        log_entry["msg"] = f"ok: {challenge}"
         recent_logs.append(log_entry)
         recent_logs[:] = recent_logs[-20:]
         return JSONResponse({"challenge": challenge})
 
-    # 消息事件（v1: event.type, v2: header.event_type）
+    # 消息事件
     if event_type == "im.message.receive_v1":
         event = body.get("event", {})
         message = event.get("message", {})
@@ -199,14 +198,12 @@ async def feishu_event(request: Request):
         sender_id = sender.get("sender_id", {})
         open_id = sender_id.get("open_id", "") or sender_id.get("user_id", "")
 
-        # 忽略机器人自己的消息
         if message.get("message_type") == "bot" or message.get("chat_type") == "bot":
-            log_entry["msg"] = "ignored: bot message"
+            log_entry["msg"] = "ignored: bot"
             recent_logs.append(log_entry)
             recent_logs[:] = recent_logs[-20:]
             return JSONResponse({"code": 0})
 
-        # 解析消息
         content_str = message.get("content", "{}")
         try:
             content = json.loads(content_str)
@@ -215,7 +212,7 @@ async def feishu_event(request: Request):
             text = content_str
 
         if not text or not open_id:
-            log_entry["msg"] = "ignored: no text or open_id"
+            log_entry["msg"] = "ignored: no content"
             recent_logs.append(log_entry)
             recent_logs[:] = recent_logs[-20:]
             return JSONResponse({"code": 0})
@@ -224,7 +221,6 @@ async def feishu_event(request: Request):
         log_entry["text"] = text[:100]
         logger.info(f"用户 {open_id[-8:]}: {text}")
 
-        # 调 AI
         try:
             history = conversations.get(open_id, [])
             reply = await call_ai(text, history)
@@ -234,23 +230,20 @@ async def feishu_event(request: Request):
             recent_logs[:] = recent_logs[-20:]
             return JSONResponse({"code": 0})
 
-        # 保存对话
         history.append({"role": "user", "content": text})
         history.append({"role": "assistant", "content": reply})
         conversations[open_id] = history[-MAX_HISTORY:]
 
-        # 回复
         try:
             await send_feishu_message(open_id, reply)
-            log_entry["msg"] = f"replied: {reply[:80]}"
+            log_entry["msg"] = f"ok: {reply[:80]}"
         except Exception as e:
             log_entry["msg"] = f"send error: {e}"
 
         recent_logs.append(log_entry)
         recent_logs[:] = recent_logs[-20:]
     else:
-        # 记录其他所有事件，用于调试
-        log_entry["msg"] = f"unhandled event: {event_type}"
+        log_entry["msg"] = f"unhandled: {event_type}"
         recent_logs.append(log_entry)
         recent_logs[:] = recent_logs[-20:]
 
@@ -263,69 +256,34 @@ async def debug():
     return {"recent_logs": recent_logs, "conversations": len(conversations)}
 
 
-@app.get("/test-feishu")
-async def test_feishu():
-    """诊断飞书连接"""
-    results = {}
-
-    # 1. 检查环境变量
-    results["app_id_set"] = bool(FEISHU_APP_ID)
-    results["app_secret_set"] = bool(FEISHU_APP_SECRET)
-    results["deepseek_key_set"] = bool(DEEPSEEK_API_KEY)
-
-    # 2. 测试获取 tenant token
-    try:
-        token = await get_tenant_token()
-        results["tenant_token"] = "OK"
-    except Exception as e:
-        results["tenant_token"] = f"FAILED: {e}"
-        return results
-
-    # 3. 测试获取 bot 信息
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            f"{FEISHU_BASE}/bot/v3/info",
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        bot_data = resp.json()
-        if bot_data.get("code") == 0:
-            bot = bot_data.get("bot", {})
-            results["bot_info"] = {
-                "name": bot.get("app_name", "unknown"),
-                "active": bot.get("activate_status", "unknown"),
-            }
-        else:
-            results["bot_info"] = f"ERROR: {bot_data}"
-
-    return results
-
-
-@app.get("/test-ds")
-async def test_deepseek():
-    """诊断 DeepSeek API Key"""
-    api_key = DEEPSEEK_API_KEY.strip()
-    return {
-        "key_length": len(api_key),
-        "starts_with_sk": api_key.startswith("sk-"),
-        "first_8_chars": api_key[:8] if len(api_key) >= 8 else api_key,
-        "last_4_chars": api_key[-4:] if len(api_key) >= 4 else "N/A",
-    }
-
-
 @app.get("/env")
 async def list_env():
-    """列出所有环境变量名（不暴露值）"""
-    all_vars = sorted(os.environ.keys())
-    return {
-        "all_vars": all_vars,
-        "total": len(all_vars),
-    }
+    all_vars = sorted(os.environ.keys()) + sorted(_runtime.keys())
+    return {"all_vars": all_vars, "total_os": len(os.environ), "total_runtime": len(_runtime)}
 
 
-# ── 健康检查 ─────────────────────────────────────
 @app.get("/health")
 async def health():
     return {"status": "ok", "timestamp": time.time()}
+
+
+# ── 运行时配置 ────────────────────────────────────
+@app.post("/setup")
+async def setup(request: Request):
+    """注入配置：FEISHU_APP_ID, FEISHU_APP_SECRET, DEEPSEEK_API_KEY"""
+    body = await request.json()
+    keys_set = []
+    for key in ["FEISHU_APP_ID", "FEISHU_APP_SECRET", "DEEPSEEK_API_KEY"]:
+        if body.get(key):
+            _runtime[key] = body[key]
+            keys_set.append(key)
+
+    return {
+        "ok": True,
+        "keys_set": keys_set,
+        "ds_key_len": len(_env("DEEPSEEK_API_KEY").strip()),
+        "app_id_set": bool(_env("FEISHU_APP_ID")),
+    }
 
 
 # ── 启动 ──────────────────────────────────────────
