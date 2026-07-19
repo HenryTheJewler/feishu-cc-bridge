@@ -157,36 +157,49 @@ async def send_feishu_message(open_id: str, text: str) -> None:
 # ── 会话存储（内存，简易版）───────────────────────
 conversations: dict = defaultdict(list)  # open_id → [{role, content}]
 MAX_HISTORY = 10  # 保留最近 10 轮对话
+recent_logs: list = []  # 最近 20 条事件日志
 
 
 # ── 飞书事件回调 ─────────────────────────────────
 @app.post("/feishu/event")
 async def feishu_event(request: Request):
     """接收飞书事件推送"""
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"code": 0})
+
+    log_entry = {"time": time.time(), "type": body.get("type", "unknown")}
     logger.info(f"收到事件: {json.dumps(body, ensure_ascii=False)[:500]}")
 
-    # URL 验证（首次配置时飞书会发 challenge）
+    # URL 验证
     if body.get("type") == "url_verification":
         challenge = body.get("challenge", "")
-        logger.info(f"URL 验证, challenge={challenge}")
+        log_entry["msg"] = f"url_verification: {challenge}"
+        recent_logs.append(log_entry)
+        recent_logs[:] = recent_logs[-20:]
         return JSONResponse({"challenge": challenge})
 
-    # 消息事件
+    # 事件回调
     if body.get("type") == "event_callback":
         event = body.get("event", {})
         event_type = event.get("type", "")
+        log_entry["event_type"] = event_type
 
-        # 收到私聊/群聊消息
         if event_type == "im.message.receive_v1":
             message = event.get("message", {})
             sender = event.get("sender", {})
-
-            # 飞书事件可能用 open_id / user_id / union_id
             sender_id = sender.get("sender_id", {})
             open_id = sender_id.get("open_id", "") or sender_id.get("user_id", "")
 
-            # 解析消息内容
+            # 忽略机器人自己的消息
+            if message.get("message_type") == "bot" or message.get("chat_type") == "bot":
+                log_entry["msg"] = "ignored: bot message"
+                recent_logs.append(log_entry)
+                recent_logs[:] = recent_logs[-20:]
+                return JSONResponse({"code": 0})
+
+            # 解析消息
             content_str = message.get("content", "{}")
             try:
                 content = json.loads(content_str)
@@ -195,19 +208,24 @@ async def feishu_event(request: Request):
                 text = content_str
 
             if not text or not open_id:
+                log_entry["msg"] = "ignored: no text or open_id"
+                recent_logs.append(log_entry)
+                recent_logs[:] = recent_logs[-20:]
                 return JSONResponse({"code": 0})
 
-            # 忽略机器人自己的消息（防回环）
-            if message.get("message_type") == "bot":
+            log_entry["open_id"] = open_id[-8:]
+            log_entry["text"] = text[:100]
+            logger.info(f"用户 {open_id[-8:]}: {text}")
+
+            # 调 AI
+            try:
+                history = conversations.get(open_id, [])
+                reply = await call_ai(text, history)
+            except Exception as e:
+                log_entry["msg"] = f"AI error: {e}"
+                recent_logs.append(log_entry)
+                recent_logs[:] = recent_logs[-20:]
                 return JSONResponse({"code": 0})
-
-            logger.info(f"用户 {open_id}: {text}")
-
-            # 构建对话历史
-            history = conversations.get(open_id, [])
-
-            # 调用 AI
-            reply = await call_ai(text, history)
 
             # 保存对话
             history.append({"role": "user", "content": text})
@@ -215,10 +233,22 @@ async def feishu_event(request: Request):
             conversations[open_id] = history[-MAX_HISTORY:]
 
             # 回复
-            await send_feishu_message(open_id, reply)
-            logger.info(f"回复 {open_id}: {reply[:100]}...")
+            try:
+                await send_feishu_message(open_id, reply)
+                log_entry["msg"] = f"replied: {reply[:80]}"
+            except Exception as e:
+                log_entry["msg"] = f"send error: {e}"
+
+            recent_logs.append(log_entry)
+            recent_logs[:] = recent_logs[-20:]
 
     return JSONResponse({"code": 0})
+
+
+# ── 调试端点 ─────────────────────────────────────
+@app.get("/debug")
+async def debug():
+    return {"recent_logs": recent_logs, "conversations": len(conversations)}
 
 
 # ── 健康检查 ─────────────────────────────────────
