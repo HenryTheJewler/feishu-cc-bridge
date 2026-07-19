@@ -312,6 +312,17 @@ async def test_deepseek():
     }
 
 
+@app.get("/env")
+async def list_env():
+    """列出所有环境变量名（不暴露值）"""
+    vars_found = {}
+    for key in sorted(os.environ.keys()):
+        val = os.environ[key]
+        if any(kw in key.upper() for kw in ["FEISHU", "DEEPSEEK", "KEY", "API", "SECRET", "APP"]):
+            vars_found[key] = f"len={len(val)}, preview={val[:6]}..."
+    return {"matching_vars": vars_found, "total_env_count": len(os.environ)}
+
+
 # ── 健康检查 ─────────────────────────────────────
 @app.get("/health")
 async def health():
