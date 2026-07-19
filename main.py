@@ -169,78 +169,86 @@ async def feishu_event(request: Request):
     except Exception:
         return JSONResponse({"code": 0})
 
-    log_entry = {"time": time.time(), "type": body.get("type", "unknown")}
-    logger.info(f"收到事件: {json.dumps(body, ensure_ascii=False)[:500]}")
+    # 记录所有事件
+    header = body.get("header", {})
+    event_type = (
+        body.get("type", "") or
+        header.get("event_type", "") or
+        body.get("event", {}).get("type", "")
+    )
+    log_entry = {"time": time.time(), "event_type": event_type or "unknown"}
+    logger.info(f"收到事件 [{event_type}]: {json.dumps(body, ensure_ascii=False)[:300]}")
 
-    # URL 验证
-    if body.get("type") == "url_verification":
-        challenge = body.get("challenge", "")
+    # URL 验证（v1 格式 & v2 格式都支持）
+    challenge = body.get("challenge", "")
+    if challenge or event_type == "url_verification":
         log_entry["msg"] = f"url_verification: {challenge}"
         recent_logs.append(log_entry)
         recent_logs[:] = recent_logs[-20:]
         return JSONResponse({"challenge": challenge})
 
-    # 事件回调
-    if body.get("type") == "event_callback":
+    # 消息事件（v1: event.type, v2: header.event_type）
+    if event_type == "im.message.receive_v1":
         event = body.get("event", {})
-        event_type = event.get("type", "")
-        log_entry["event_type"] = event_type
+        message = event.get("message", {})
+        sender = event.get("sender", {})
+        sender_id = sender.get("sender_id", {})
+        open_id = sender_id.get("open_id", "") or sender_id.get("user_id", "")
 
-        if event_type == "im.message.receive_v1":
-            message = event.get("message", {})
-            sender = event.get("sender", {})
-            sender_id = sender.get("sender_id", {})
-            open_id = sender_id.get("open_id", "") or sender_id.get("user_id", "")
-
-            # 忽略机器人自己的消息
-            if message.get("message_type") == "bot" or message.get("chat_type") == "bot":
-                log_entry["msg"] = "ignored: bot message"
-                recent_logs.append(log_entry)
-                recent_logs[:] = recent_logs[-20:]
-                return JSONResponse({"code": 0})
-
-            # 解析消息
-            content_str = message.get("content", "{}")
-            try:
-                content = json.loads(content_str)
-                text = content.get("text", "")
-            except json.JSONDecodeError:
-                text = content_str
-
-            if not text or not open_id:
-                log_entry["msg"] = "ignored: no text or open_id"
-                recent_logs.append(log_entry)
-                recent_logs[:] = recent_logs[-20:]
-                return JSONResponse({"code": 0})
-
-            log_entry["open_id"] = open_id[-8:]
-            log_entry["text"] = text[:100]
-            logger.info(f"用户 {open_id[-8:]}: {text}")
-
-            # 调 AI
-            try:
-                history = conversations.get(open_id, [])
-                reply = await call_ai(text, history)
-            except Exception as e:
-                log_entry["msg"] = f"AI error: {e}"
-                recent_logs.append(log_entry)
-                recent_logs[:] = recent_logs[-20:]
-                return JSONResponse({"code": 0})
-
-            # 保存对话
-            history.append({"role": "user", "content": text})
-            history.append({"role": "assistant", "content": reply})
-            conversations[open_id] = history[-MAX_HISTORY:]
-
-            # 回复
-            try:
-                await send_feishu_message(open_id, reply)
-                log_entry["msg"] = f"replied: {reply[:80]}"
-            except Exception as e:
-                log_entry["msg"] = f"send error: {e}"
-
+        # 忽略机器人自己的消息
+        if message.get("message_type") == "bot" or message.get("chat_type") == "bot":
+            log_entry["msg"] = "ignored: bot message"
             recent_logs.append(log_entry)
             recent_logs[:] = recent_logs[-20:]
+            return JSONResponse({"code": 0})
+
+        # 解析消息
+        content_str = message.get("content", "{}")
+        try:
+            content = json.loads(content_str)
+            text = content.get("text", "")
+        except json.JSONDecodeError:
+            text = content_str
+
+        if not text or not open_id:
+            log_entry["msg"] = "ignored: no text or open_id"
+            recent_logs.append(log_entry)
+            recent_logs[:] = recent_logs[-20:]
+            return JSONResponse({"code": 0})
+
+        log_entry["open_id"] = open_id[-8:]
+        log_entry["text"] = text[:100]
+        logger.info(f"用户 {open_id[-8:]}: {text}")
+
+        # 调 AI
+        try:
+            history = conversations.get(open_id, [])
+            reply = await call_ai(text, history)
+        except Exception as e:
+            log_entry["msg"] = f"AI error: {e}"
+            recent_logs.append(log_entry)
+            recent_logs[:] = recent_logs[-20:]
+            return JSONResponse({"code": 0})
+
+        # 保存对话
+        history.append({"role": "user", "content": text})
+        history.append({"role": "assistant", "content": reply})
+        conversations[open_id] = history[-MAX_HISTORY:]
+
+        # 回复
+        try:
+            await send_feishu_message(open_id, reply)
+            log_entry["msg"] = f"replied: {reply[:80]}"
+        except Exception as e:
+            log_entry["msg"] = f"send error: {e}"
+
+        recent_logs.append(log_entry)
+        recent_logs[:] = recent_logs[-20:]
+    else:
+        # 记录其他所有事件，用于调试
+        log_entry["msg"] = f"unhandled event: {event_type}"
+        recent_logs.append(log_entry)
+        recent_logs[:] = recent_logs[-20:]
 
     return JSONResponse({"code": 0})
 
@@ -249,6 +257,43 @@ async def feishu_event(request: Request):
 @app.get("/debug")
 async def debug():
     return {"recent_logs": recent_logs, "conversations": len(conversations)}
+
+
+@app.get("/test-feishu")
+async def test_feishu():
+    """诊断飞书连接"""
+    results = {}
+
+    # 1. 检查环境变量
+    results["app_id_set"] = bool(FEISHU_APP_ID)
+    results["app_secret_set"] = bool(FEISHU_APP_SECRET)
+    results["deepseek_key_set"] = bool(DEEPSEEK_API_KEY)
+
+    # 2. 测试获取 tenant token
+    try:
+        token = await get_tenant_token()
+        results["tenant_token"] = "OK"
+    except Exception as e:
+        results["tenant_token"] = f"FAILED: {e}"
+        return results
+
+    # 3. 测试获取 bot 信息
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{FEISHU_BASE}/bot/v3/info",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        bot_data = resp.json()
+        if bot_data.get("code") == 0:
+            bot = bot_data.get("bot", {})
+            results["bot_info"] = {
+                "name": bot.get("app_name", "unknown"),
+                "active": bot.get("activate_status", "unknown"),
+            }
+        else:
+            results["bot_info"] = f"ERROR: {bot_data}"
+
+    return results
 
 
 # ── 健康检查 ─────────────────────────────────────
