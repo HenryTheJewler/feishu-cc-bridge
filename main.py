@@ -25,18 +25,43 @@ SEND_MSG_URL = f"{FEISHU_BASE}/im/v1/messages"
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
 
-# ── 运行时配置（/setup 注入或环境变量）─────────────
+# ── 运行时配置（/setup 注入、环境变量、持久化文件）────
+RUNTIME_FILE = "/data/runtime.json"
 _runtime: dict = {}
+_last_interaction: float = time.time()
 
 FEISHU_WEBHOOK = os.environ.get(
     "FEISHU_WEBHOOK",
     "https://open.feishu.cn/open-apis/bot/v2/hook/786188af-8586-4ebb-9417-f8ad89943a9a",
 )
 
+# 1. 从环境变量加载
 for _key in ["FEISHU_APP_ID", "FEISHU_APP_SECRET", "DEEPSEEK_API_KEY"]:
     _val = os.environ.get(_key, "")
     if _val:
         _runtime[_key] = _val
+
+# 2. 从持久化文件加载（覆盖环境变量）
+try:
+    if os.path.exists(RUNTIME_FILE):
+        with open(RUNTIME_FILE) as f:
+            _saved = json.load(f)
+            _runtime.update(_saved)
+            _last_interaction = _saved.get("_last_interaction", time.time())
+            logger.info(f"从 {RUNTIME_FILE} 加载了 {len(_saved)} 个配置项")
+except Exception as e:
+    logger.warning(f"加载持久化配置失败: {e}")
+
+
+def _save_runtime():
+    """持久化运行时配置到文件"""
+    try:
+        os.makedirs(os.path.dirname(RUNTIME_FILE), exist_ok=True)
+        _runtime["_last_interaction"] = _last_interaction
+        with open(RUNTIME_FILE, "w") as f:
+            json.dump(dict(_runtime), f)
+    except Exception as e:
+        logger.warning(f"保存配置失败: {e}")
 
 
 def _env(key: str) -> str:
@@ -224,6 +249,8 @@ async def feishu_event(request: Request):
 
         log_entry["open_id"] = open_id[-8:]
         log_entry["text"] = text[:100]
+        _last_interaction = time.time()
+        _save_runtime()
         logger.info(f"用户 {open_id[-8:]}: {text}")
 
         try:
@@ -283,6 +310,8 @@ async def setup(request: Request):
             _runtime[key] = body[key]
             keys_set.append(key)
 
+    _save_runtime()
+
     return {
         "ok": True,
         "keys_set": keys_set,
@@ -301,6 +330,21 @@ async def remind(msg: str = "中午了，来找Claude。今天把周计划排了
             json={"msg_type": "text", "content": {"text": msg}},
         )
         return {"ok": resp.json().get("code") == 0}
+
+
+@app.get("/check-inactive")
+async def check_inactive(hours: int = 24):
+    """如果超过指定小时没互动，推送提醒"""
+    elapsed = (time.time() - _last_interaction) / 3600
+    if elapsed > hours:
+        msg = f"你已经 {elapsed:.0f} 小时没找Claude了。来看看，该推进的事别落下。"
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                FEISHU_WEBHOOK,
+                json={"msg_type": "text", "content": {"text": msg}},
+            )
+        return {"reminded": True, "elapsed_hours": round(elapsed, 1), "sent": resp.json()}
+    return {"reminded": False, "elapsed_hours": round(elapsed, 1)}
 
 
 # ── 启动 ──────────────────────────────────────────
