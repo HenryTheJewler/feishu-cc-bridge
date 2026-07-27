@@ -226,6 +226,10 @@ async def handle_command(text: str, open_id: str, token: str) -> str:
     """处理工作台指令，返回回复文本。不匹配则返回空字符串"""
     t = text.strip()
 
+    # 工作台链接
+    if t in ["工作台", "表格", "链接"]:
+        return "📊 旺德兰工作台\nhttps://personal.feishu.cn/base/ZXQabyZy7aXPvDsNBb2cOtY2nAh"
+
     # 今日任务
     if t in ["今日任务", "今天任务", "任务", "今日待办", "待办"]:
         tasks = await bitable_get(token, TASK_TABLE, filter_status="待办")
@@ -298,6 +302,43 @@ async def handle_command(text: str, open_id: str, token: str) -> str:
                     json={"fields": {"状态": "已完成"}})
                 return f"✅ 已完成：{r['fields']['任务名']}"
         return f"❌ 没找到包含「{keyword}」的任务"
+
+    # 概览
+    if t in ["概览", "工作概览", "总结", "overview"]:
+        # 任务统计
+        all_tasks = await bitable_get(token, TASK_TABLE)
+        done = len([x for x in all_tasks if x.get("状态") == "已完成"])
+        pending = len([x for x in all_tasks if x.get("状态") == "待办"])
+        in_progress = len([x for x in all_tasks if x.get("状态") == "进行中"])
+        total = len(all_tasks)
+        # 产品统计
+        products = await bitable_get(token, PRODUCT_TABLE)
+        in_dev = len([p for p in products if p.get("开发进度") not in ["上市","取消"]])
+        launched = len([p for p in products if p.get("开发进度") == "上市"])
+        # 本周任务
+        import datetime
+        today = datetime.date.today()
+        dow = today.weekday()
+        week_days_cn = ["周一","周二","周三","周四","周五","周六","周日"]
+        week_days_en = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"]
+        this_week = [t for t in all_tasks if t.get("星期") in week_days_en[:dow+1] and t.get("状态") != "已完成"]
+        due_soon = [t for t in all_tasks if t.get("截止日") and t.get("状态") != "已完成"]
+
+        pct = round(done/total*100) if total > 0 else 0
+        return f"""📊 旺德兰工作概览
+
+━━ 任务 ━━
+✅ 已完成：{done}
+🔄 进行中：{in_progress}
+⬜ 待办：{pending}
+📈 完成率：{pct}%（{done}/{total}）
+
+━━ 本周 ━━
+📋 本周待办：{len(this_week)} 项
+
+━━ 产品 ━━
+🚀 在售：{launched} 款
+🔧 开发中：{in_dev} 款"""
 
     return ""  # 不是命令，交给 AI 处理
 
