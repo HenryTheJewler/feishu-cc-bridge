@@ -25,6 +25,12 @@ SEND_MSG_URL = f"{FEISHU_BASE}/im/v1/messages"
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
 
+# ── 多维表格配置 ──────────────────────────────────
+BITABLE_TOKEN = "ZXQabyZy7aXPvDsNBb2cOtY2nAh"
+TASK_TABLE = "tblI091ScDdzraKV"
+PRODUCT_TABLE = "tblnZWVUgk3e7Ghs"
+BITABLE_BASE = f"{FEISHU_BASE}/bitable/v1/apps/{BITABLE_TOKEN}/tables"
+
 # ── 运行时配置（/setup 注入、环境变量、持久化文件）────
 RUNTIME_FILE = "/data/runtime.json"
 _runtime: dict = {}
@@ -189,6 +195,113 @@ async def send_feishu_message(open_id: str, text: str) -> None:
             logger.error(f"发送消息失败: {data}")
 
 
+# ── 多维表格操作 ──────────────────────────────────
+async def bitable_get(token: str, table: str, filter_status: str = None, assignee: str = None):
+    """查询表格记录"""
+    url = f"{BITABLE_BASE}/{table}/records"
+    resp = httpx.get(url, headers={"Authorization": f"Bearer {token}"})
+    if resp.status_code != 200:
+        return []
+    records = resp.json().get("data", {}).get("items", [])
+    results = []
+    for r in records:
+        f = r.get("fields", {})
+        if filter_status and f.get("状态") != filter_status:
+            continue
+        if assignee and f.get("执行人") != assignee:
+            continue
+        results.append(f)
+    return results
+
+
+async def bitable_add(token: str, table: str, fields: dict):
+    """添加记录"""
+    resp = httpx.post(f"{BITABLE_BASE}/{table}/records",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        json={"fields": fields})
+    return resp.json().get("code") == 0
+
+
+async def handle_command(text: str, open_id: str, token: str) -> str:
+    """处理工作台指令，返回回复文本。不匹配则返回空字符串"""
+    t = text.strip()
+
+    # 今日任务
+    if t in ["今日任务", "今天任务", "任务", "今日待办", "待办"]:
+        tasks = await bitable_get(token, TASK_TABLE, filter_status="待办")
+        if not tasks:
+            return "✅ 今天没有待办任务。"
+        lines = ["📋 今日待办："]
+        for i, tk in enumerate(tasks, 1):
+            q = (tk.get("四象限","") or "")[:2]
+            name = tk.get("任务名","")
+            who = f" [{tk.get('执行人')}]" if tk.get("执行人") else ""
+            lines.append(f"{i}. {q} {name}{who}")
+        return "\n".join(lines)
+
+    # 产品进度
+    if t in ["产品进度", "产品", "开发进度"]:
+        products = await bitable_get(token, PRODUCT_TABLE)
+        active = [p for p in products if p.get("开发进度") not in ["上市","取消"]]
+        if not active:
+            return "暂无开发中的产品。"
+        lines = ["📐 产品开发进度："]
+        for p in active:
+            lines.append(f"• {p.get('产品名称','')} [{p.get('开发进度','')}] — {p.get('负责人','')}")
+        return "\n".join(lines)
+
+    # 上市产品
+    if t in ["上市产品", "在售"]:
+        products = await bitable_get(token, PRODUCT_TABLE)
+        active = [p for p in products if p.get("开发进度") == "上市"]
+        if not active:
+            return "暂无上市产品。"
+        lines = ["🏷 在售产品："]
+        for p in active:
+            sales = p.get("销售数量", 0) or 0
+            price = p.get("定价(¥)", 0) or 0
+            lines.append(f"• {p.get('产品名称','')} | ¥{price} | 已售{sales}件")
+        return "\n".join(lines)
+
+    # 我的任务
+    if t in ["我的任务"]:
+        return "请发「我的任务 [名字]」来查询"
+
+    if t.startswith("我的任务 "):
+        name = t[5:].strip()
+        tasks = await bitable_get(token, TASK_TABLE, assignee=name)
+        pending = [tk for tk in tasks if tk.get("状态") != "已完成"]
+        if not pending:
+            return f"✅ {name} 没有待办任务。"
+        lines = [f"📋 {name} 的待办："]
+        for i, tk in enumerate(pending, 1):
+            lines.append(f"{i}. {tk.get('任务名','')} [{tk.get('状态','')}]")
+        return "\n".join(lines)
+
+    # 添加任务
+    if t.startswith("添加 "):
+        title = t[3:].strip()
+        await bitable_add(token, TASK_TABLE, {"任务名": title, "状态": "待办", "四象限": "🟡 重要不紧急"})
+        return f"✅ 已添加：{title}"
+
+    # 完成
+    if t.startswith("完成 "):
+        keyword = t[3:].strip()
+        url = f"{BITABLE_BASE}/{TASK_TABLE}/records"
+        resp = httpx.get(url, headers={"Authorization": f"Bearer {token}"})
+        records = resp.json().get("data", {}).get("items", [])
+        for r in records:
+            if keyword in r.get("fields",{}).get("任务名",""):
+                rid = r["record_id"]
+                httpx.put(f"{url}/{rid}",
+                    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                    json={"fields": {"状态": "已完成"}})
+                return f"✅ 已完成：{r['fields']['任务名']}"
+        return f"❌ 没找到包含「{keyword}」的任务"
+
+    return ""  # 不是命令，交给 AI 处理
+
+
 # ── 会话存储 ──────────────────────────────────────
 conversations: dict = defaultdict(list)
 MAX_HISTORY = 10
@@ -253,6 +366,24 @@ async def feishu_event(request: Request):
         _save_runtime()
         logger.info(f"用户 {open_id[-8:]}: {text}")
 
+        # 先检查是否工作台指令
+        try:
+            tkn = await get_tenant_token()
+            cmd_reply = await handle_command(text, open_id, tkn)
+        except Exception:
+            cmd_reply = ""
+
+        if cmd_reply:
+            try:
+                await send_feishu_message(open_id, cmd_reply)
+                log_entry["msg"] = f"cmd: {cmd_reply[:80]}"
+            except Exception as e:
+                log_entry["msg"] = f"cmd send error: {e}"
+            recent_logs.append(log_entry)
+            recent_logs[:] = recent_logs[-20:]
+            return JSONResponse({"code": 0})
+
+        # 不是指令，调 AI
         try:
             history = conversations.get(open_id, [])
             reply = await call_ai(text, history)
