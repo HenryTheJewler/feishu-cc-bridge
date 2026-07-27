@@ -325,7 +325,7 @@ async def handle_command(text: str, open_id: str, token: str) -> str:
         due_soon = [t for t in all_tasks if t.get("截止日") and t.get("状态") != "已完成"]
 
         pct = round(done/total*100) if total > 0 else 0
-        return f"""📊 旺德兰工作概览
+        return f"""📊 Spark & Co. 工作概览
 
 ━━ 任务 ━━
 ✅ 已完成：{done}
