@@ -26,9 +26,9 @@ DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
 
 # ── 多维表格配置 ──────────────────────────────────
-BITABLE_TOKEN = "ZXQabyZy7aXPvDsNBb2cOtY2nAh"
-TASK_TABLE = "tblI091ScDdzraKV"
-PRODUCT_TABLE = "tblnZWVUgk3e7Ghs"
+BITABLE_TOKEN = "QTaYbH2F7an4mDsjomzc10zyn0c"
+TASK_TABLE = "tblLnKSx0kmIWSbL"
+PRODUCT_TABLE = "tbly6hQ2iJZupaRn"
 BITABLE_BASE = f"{FEISHU_BASE}/bitable/v1/apps/{BITABLE_TOKEN}/tables"
 
 # ── 运行时配置（/setup 注入、环境变量、持久化文件）────
@@ -228,7 +228,7 @@ async def handle_command(text: str, open_id: str, token: str) -> str:
 
     # 工作台链接
     if t in ["工作台", "表格", "链接"]:
-        return "📊 旺德兰工作台\nhttps://personal.feishu.cn/base/ZXQabyZy7aXPvDsNBb2cOtY2nAh"
+        return "📊 Spark & Co.\nhttps://my.feishu.cn/base/QTaYbH2F7an4mDsjomzc10zyn0c"
 
     # 今日任务
     if t in ["今日任务", "今天任务", "任务", "今日待办", "待办"]:
